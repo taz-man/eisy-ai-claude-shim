@@ -1,0 +1,15 @@
+services:
+  eisy-ai-claude-shim:
+    build: .
+    image: eisy-ai-claude-shim:latest
+    container_name: eisy-ai-claude-shim
+    restart: unless-stopped
+    ports:
+      - "8799:8799"
+    environment:
+      EISY_SHIM_API_KEY: "${EISY_SHIM_API_KEY}"
+    volumes:
+      - claude-auth:/root/.claude
+
+volumes:
+  claude-auth:
