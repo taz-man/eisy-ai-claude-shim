@@ -37,6 +37,7 @@ from directsdk import Client, ClaudeAPIError, ClaudeCodeLoggedOut, ClaudeCodeMis
 HOST = os.environ.get("EISY_SHIM_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EISY_SHIM_PORT", "8787"))
 SHIM_API_KEY = os.environ.get("EISY_SHIM_API_KEY")  # if set, required as x-api-key
+DEFAULT_CACHE_TTL = os.environ.get("EISY_SHIM_CACHE_TTL", "5m")  # "5m", "1h", or "" to disable
 LOG_PATH = os.environ.get("EISY_SHIM_LOG", os.path.join(os.path.dirname(__file__), "requests.log"))
 
 client = Client()
@@ -58,12 +59,29 @@ def log(event: dict):
 # ---------------------------------------------------------------------------
 
 def anthropic_messages_to_openai(system, messages):
-    """Anthropic `messages` (+ top-level `system`) -> OpenAI-style `messages`."""
+    """Anthropic `messages` (+ top-level `system`) -> OpenAI-style `messages`.
+
+    Splits `system` blocks by whether nucore marked them `cache_control`:
+    cacheable (static) blocks stay in the system message; everything else
+    (dynamic per-turn content, e.g. live device state) is moved into the
+    latest message instead. This matters because directsdk's
+    conversation_session_id() hashes [system, first_frame] to derive a
+    stable --session-id for native Claude Code to resume across calls --
+    if any dynamic byte lives inside `system`, the hash (and therefore the
+    session, and therefore any cache reuse) changes on every single turn.
+    """
     out = []
+    dynamic_text = ""
     if system:
         if isinstance(system, list):  # Anthropic allows system as content blocks too
-            system = "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
-        out.append({"role": "system", "content": system})
+            static_parts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("cache_control")]
+            dynamic_parts = [b.get("text", "") for b in system if isinstance(b, dict) and not b.get("cache_control")]
+            system_str = "\n".join(static_parts)
+            dynamic_text = "\n".join(dynamic_parts)
+        else:
+            system_str = system
+        if system_str:
+            out.append({"role": "system", "content": system_str})
 
     for msg in messages:
         role = msg.get("role")
@@ -119,7 +137,80 @@ def anthropic_messages_to_openai(system, messages):
         elif text_parts:
             out.append({"role": role, "content": "\n".join(text_parts)})
 
+    if dynamic_text:
+        # Prepend the non-cacheable system content to the latest message
+        # with plain string content, rather than back into `system` where
+        # it would poison the session-id hash on every turn. Walk backward
+        # for the nearest string-content message (an assistant tool_calls
+        # entry has content=None and isn't eligible).
+        for entry in reversed(out):
+            if isinstance(entry.get("content"), str):
+                entry["content"] = dynamic_text + "\n\n" + entry["content"]
+                break
+        else:
+            out.append({"role": "user", "content": dynamic_text})
+
     return out
+
+
+def _dump_request_shape(body):
+    """Diagnostic only (EISY_SHIM_DEBUG_SHAPE=1): log the structural shape of
+    a real incoming request -- never its text content -- so we can see
+    whether nucore sends `system` as a single string or multiple blocks,
+    and where (if anywhere) it places cache_control markers. This is what
+    determines whether our flattening in anthropic_messages_to_openai() is
+    destroying a static/dynamic cache split nucore intended to preserve.
+    """
+    system = body.get("system")
+    shape = {"system_type": type(system).__name__}
+    if isinstance(system, list):
+        shape["system_block_count"] = len(system)
+        shape["system_block_types"] = [b.get("type") if isinstance(b, dict) else type(b).__name__ for b in system]
+        shape["system_cache_control"] = [b.get("cache_control") if isinstance(b, dict) else None for b in system]
+        shape["system_block_lengths"] = [len(b.get("text", "")) if isinstance(b, dict) else None for b in system]
+    messages = body.get("messages", [])
+    shape["message_count"] = len(messages)
+    msg_shapes = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            msg_shapes.append({
+                "role": m.get("role"), "block_count": len(content),
+                "block_types": [b.get("type") if isinstance(b, dict) else type(b).__name__ for b in content],
+                "cache_control": [b.get("cache_control") if isinstance(b, dict) else None for b in content],
+            })
+        else:
+            msg_shapes.append({"role": m.get("role"), "content_type": type(content).__name__})
+    shape["messages"] = msg_shapes
+    shape["top_level_keys"] = sorted(body.keys())
+    log({"event": "debug_shape", **shape})
+
+
+def detect_cache_ttl(body):
+    """Find an Anthropic cache_control hint anywhere in the request and map
+    it to directsdk's `hermes_cache_ttl` kwarg -- the thing that actually
+    tells native Claude Code to set CLAUDE_CODE_PROMPT_CACHE_TTL and request
+    caching from Anthropic at all. Without this, nucore's own cache_control
+    markers (and its "cache_ttl": "5m" config) were being silently dropped
+    on the floor, forcing every request to pay full, non-cached input-token
+    rates (~10-20x more expensive, and ~10-20x faster subscription-window
+    consumption) even on repeated turns of the same conversation.
+    """
+    def blocks():
+        system = body.get("system")
+        if isinstance(system, list):
+            yield from system
+        for msg in body.get("messages", []):
+            content = msg.get("content")
+            if isinstance(content, list):
+                yield from content
+
+    for block in blocks():
+        if isinstance(block, dict) and isinstance(block.get("cache_control"), dict):
+            ttl = block["cache_control"].get("ttl", "5m")
+            if ttl == "5m":
+                return "5m"
+    return None
 
 
 def anthropic_tools_to_openai(tools):
@@ -167,6 +258,7 @@ def openai_response_to_anthropic(resp_dict, requested_model):
 
     usage = resp_dict.get("usage", {})
     admission = usage.get("native_admission", {})
+    native_usage = usage.get("native_usage", {})
 
     return {
         "id": resp_dict.get("id") or f"msg_{uuid.uuid4().hex}",
@@ -179,6 +271,8 @@ def openai_response_to_anthropic(resp_dict, requested_model):
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
+            "cache_creation_input_tokens": native_usage.get("cache_creation_input_tokens", 0),
+            "cache_read_input_tokens": native_usage.get("cache_read_input_tokens", 0),
         },
     }, admission
 
@@ -249,6 +343,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "bad json"}})
             return
 
+        if os.environ.get("EISY_SHIM_DEBUG_SHAPE"):
+            _dump_request_shape(body)
+
         model = body.get("model", "sonnet")
         openai_messages = anthropic_messages_to_openai(body.get("system"), body.get("messages", []))
         openai_tools = anthropic_tools_to_openai(body.get("tools"))
@@ -262,6 +359,10 @@ class Handler(BaseHTTPRequestHandler):
         }
         if openai_tools:
             kwargs["tools"] = openai_tools
+
+        cache_ttl = detect_cache_ttl(body) or (DEFAULT_CACHE_TTL or None)
+        if cache_ttl == "5m":
+            kwargs["hermes_cache_ttl"] = "5m"
 
         t0 = time.monotonic()
         try:
@@ -288,6 +389,8 @@ class Handler(BaseHTTPRequestHandler):
             "event": "request", "model": model, "duration_ms": dt_ms,
             "input_tokens": anthropic_resp["usage"]["input_tokens"],
             "output_tokens": anthropic_resp["usage"]["output_tokens"],
+            "cache_creation_input_tokens": anthropic_resp["usage"]["cache_creation_input_tokens"],
+            "cache_read_input_tokens": anthropic_resp["usage"]["cache_read_input_tokens"],
             "stop_reason": anthropic_resp["stop_reason"],
             "upstream_requests": admission.get("upstream_requests"),
             "blocked_requests": admission.get("blocked_requests"),

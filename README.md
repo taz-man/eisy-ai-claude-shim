@@ -37,6 +37,12 @@ January 2026).
   eisy-ai's SDK appends) — currently implemented as one non-incremental SSE
   flush rather than true token-by-token streaming; good enough not to break
   eisy-ai's client, but responses arrive all at once
+- **Prompt-cache reuse across turns of the same conversation**, confirmed
+  against real eisy-ai traffic: `cache_read_input_tokens` went from 0% to
+  38-53%+ within a session after fixing how `system` content is split (see
+  below). Anthropic's cache-read price is roughly 10-20x cheaper than a
+  fresh input token, so this matters a lot for both subscription-window
+  consumption and raw cost if you ever do run this against a metered key.
 - Every response's usage carries Claude Code's own `native_admission` data
   (`upstream_requests`, `blocked_requests`, `rate_limit.using_overage`,
   `rate_limit.utilization`) — the shim logs these per request to
@@ -162,6 +168,18 @@ guarantee against that.
   though `HostConfig.PortBindings` looks correct. This is a host-side
   docker-proxy binding failure, not a config mistake — pick a different
   host port and move on rather than re-debugging the same one.
+- **Prompt caching never hits (`cache_read_input_tokens` always 0), even
+  across turns of one conversation**: this was a real bug, fixed in this
+  repo. eisy-ai sends `system` as multiple content blocks — some marked
+  `cache_control` (static: tool manifests, device lists), some not (dynamic:
+  live device state, timestamps). `directsdk.py`'s `conversation_session_id()`
+  derives a stable `--session-id` by hashing `[system, first_frame]` — if any
+  byte of the dynamic block ends up inside that hashed `system` value, the
+  derived session id changes on *every single turn*, native Claude Code
+  never resumes the same session, and nothing ever gets cached. The fix:
+  split `system` blocks by whether they carry `cache_control`, keep only the
+  static ones in the hashed system string, and move dynamic content into the
+  actual per-turn message instead, where changing bytes don't matter.
 
 ## Attribution
 
