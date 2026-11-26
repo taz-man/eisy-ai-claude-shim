@@ -32,7 +32,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
 
-from directsdk import Client, ClaudeAPIError, ClaudeCodeLoggedOut, ClaudeCodeMissing  # noqa: E402
+from directsdk import Client, ClaudeAPIError, ClaudeCodeLoggedOut, ClaudeCodeMissing, RequestRejected  # noqa: E402
 
 HOST = os.environ.get("EISY_SHIM_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EISY_SHIM_PORT", "8787"))
@@ -387,6 +387,17 @@ class Handler(BaseHTTPRequestHandler):
                  "status_code": getattr(e, "status_code", None)})
             self._send_json(getattr(e, "status_code", None) or 502,
                              {"type": "error", "error": {"type": "api_error", "message": str(e)}})
+            return
+        except RequestRejected as e:
+            log({"event": "error", "kind": "request_rejected", "detail": str(e)})
+            self._send_json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}})
+            return
+        except Exception as e:
+            # Never let an unanticipated exception just drop the connection
+            # (curl/eisy-ai then sees a bare connection failure, not a
+            # diagnosable error) -- always return *some* clean JSON error.
+            log({"event": "error", "kind": "unexpected", "detail": repr(e)})
+            self._send_json(500, {"type": "error", "error": {"type": "api_error", "message": f"shim internal error: {e}"}})
             return
 
         anthropic_resp, admission, canonical_model = openai_response_to_anthropic(resp_dict, model)

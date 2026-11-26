@@ -187,6 +187,14 @@ guarantee against that.
   split `system` blocks by whether they carry `cache_control`, keep only the
   static ones in the hashed system string, and move dynamic content into the
   actual per-turn message instead, where changing bytes don't matter.
+- **A malformed/edge-case request silently drops the connection** (curl sees
+  "empty reply from server", eisy-ai sees a bare connection error with no
+  detail) instead of returning a clean error. This happened because
+  `directsdk.py` can raise `RequestRejected` (e.g. "History must end in a
+  nonempty user/tool-result message") which wasn't caught, so it propagated
+  up and killed the handler thread mid-response. Fixed: `RequestRejected`
+  now returns a clean `400`, and any other unanticipated exception returns a
+  `500` instead of dropping the connection.
 
 ## Attribution
 
