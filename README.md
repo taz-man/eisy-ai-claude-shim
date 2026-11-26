@@ -46,8 +46,15 @@ January 2026).
 - Every response's usage carries Claude Code's own `native_admission` data
   (`upstream_requests`, `blocked_requests`, `rate_limit.using_overage`,
   `rate_limit.utilization`) — the shim logs these per request to
-  `requests.log` so you can confirm you're staying inside your subscription
+  `requests.log` (persisted in the `shim-logs` volume, survives container
+  rebuilds) so you can confirm you're staying inside your subscription
   window and never hitting overage billing
+- Each log line also records `model_requested` vs `model_answered` —
+  `model_answered` comes from the real native response's own cost/usage
+  breakdown (`native_cost.modelUsage`), not just an echo of what was asked
+  for, so you can independently verify which model actually processed a
+  given request (e.g. confirming eisy-ai's customer-mode/developer-mode
+  switch really is routing to different models).
 
 ## Known limitations
 

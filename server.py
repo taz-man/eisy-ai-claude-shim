@@ -38,7 +38,8 @@ HOST = os.environ.get("EISY_SHIM_HOST", "0.0.0.0")
 PORT = int(os.environ.get("EISY_SHIM_PORT", "8787"))
 SHIM_API_KEY = os.environ.get("EISY_SHIM_API_KEY")  # if set, required as x-api-key
 DEFAULT_CACHE_TTL = os.environ.get("EISY_SHIM_CACHE_TTL", "5m")  # "5m", "1h", or "" to disable
-LOG_PATH = os.environ.get("EISY_SHIM_LOG", os.path.join(os.path.dirname(__file__), "requests.log"))
+LOG_PATH = os.environ.get("EISY_SHIM_LOG", "/app/logs/requests.log" if os.path.isdir("/app/logs")
+                           else os.path.join(os.path.dirname(__file__), "requests.log"))
 
 client = Client()
 
@@ -259,6 +260,11 @@ def openai_response_to_anthropic(resp_dict, requested_model):
     usage = resp_dict.get("usage", {})
     admission = usage.get("native_admission", {})
     native_usage = usage.get("native_usage", {})
+    # The actual model Anthropic's backend answered with, independent of
+    # whatever alias/string was requested -- keys of native_cost.modelUsage
+    # are the ground truth, confirmed live against a real response.
+    model_usage = usage.get("native_cost", {}).get("modelUsage", {})
+    canonical_model = next(iter(model_usage), None)
 
     return {
         "id": resp_dict.get("id") or f"msg_{uuid.uuid4().hex}",
@@ -274,7 +280,7 @@ def openai_response_to_anthropic(resp_dict, requested_model):
             "cache_creation_input_tokens": native_usage.get("cache_creation_input_tokens", 0),
             "cache_read_input_tokens": native_usage.get("cache_read_input_tokens", 0),
         },
-    }, admission
+    }, admission, canonical_model
 
 
 # ---------------------------------------------------------------------------
@@ -383,10 +389,10 @@ class Handler(BaseHTTPRequestHandler):
                              {"type": "error", "error": {"type": "api_error", "message": str(e)}})
             return
 
-        anthropic_resp, admission = openai_response_to_anthropic(resp_dict, model)
+        anthropic_resp, admission, canonical_model = openai_response_to_anthropic(resp_dict, model)
         dt_ms = int((time.monotonic() - t0) * 1000)
         log({
-            "event": "request", "model": model, "duration_ms": dt_ms,
+            "event": "request", "model_requested": model, "model_answered": canonical_model, "duration_ms": dt_ms,
             "input_tokens": anthropic_resp["usage"]["input_tokens"],
             "output_tokens": anthropic_resp["usage"]["output_tokens"],
             "cache_creation_input_tokens": anthropic_resp["usage"]["cache_creation_input_tokens"],

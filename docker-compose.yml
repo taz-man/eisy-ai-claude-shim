@@ -10,6 +10,8 @@ services:
       EISY_SHIM_API_KEY: "${EISY_SHIM_API_KEY}"
     volumes:
       - claude-auth:/root/.claude
+      - shim-logs:/app/logs
 
 volumes:
   claude-auth:
+  shim-logs:
